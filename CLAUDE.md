@@ -226,6 +226,21 @@ where the arithmetic actually reaches the window** — `--min-clip 5 --max-clip 
 overruns its cap by 2 s and has nothing to do with Whisper, so saying otherwise
 would be an explanation fitted to a number it does not describe.
 
+### A failed TTS utterance must not end the stdin filter
+
+The bare `tts` / `voice tts` invocation keeps its loaded model and reference
+across input lines. A `Synthesizer::say` error belongs to that line: log the
+text and error on stderr, count it as skipped, and continue without writing
+audio for it. Propagating that error with `?` used to terminate a live pipeline
+on a single prosody alignment failure (21 characters versus 17 counts for
+`「刚才那样喜欢吗」「哪句太过了我以后改」，`).
+
+Keep this recovery boundary around synthesis only. Model/reference setup and
+input/output errors still stop the filter, including a failed per-line flush
+when the downstream player closes. `convert` retains its documented stop-on-
+error behavior for batch files. The filter tests inject synthesis failures
+and check the PCM emitted before and after them without loading any models.
+
 ### `completions` belongs to the binary, not to the engine
 It is the one subcommand in the list above that is **not** part of any engine's
 clap type — nor of `PreprocessCommand`, which follows the same rule for the same

@@ -23,6 +23,10 @@ describes a binary rather than an engine: use `voice completions` there.
 | `tts completions <shell>` | completion script for bash, zsh, fish, powershell or elvish |
 
 Logs go to stderr, so stdout is only ever samples. Blank input lines are skipped.
+In the bare stdin filter, a synthesis failure logs the offending line and its
+error to stderr, skips that utterance, and continues reading. Successful lines
+still emit audio immediately; the final log counts spoken and failed lines.
+Model/reference setup failures and stdin/stdout errors still stop the filter.
 
 `tts download` fetches what a default run fetches on demand — the GPT-SoVITS
 bundle and the prosody encoder — and prints where each landed, which is what

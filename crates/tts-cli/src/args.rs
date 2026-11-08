@@ -6,7 +6,8 @@
 //! echo "你好世界" | tts --reference clip.wav | ffplay -f f32le -ar 32000 -ac 1 -
 //! ```
 //!
-//! One line in, one utterance out, so a script is a file of lines. `--sr`
+//! One line in, one utterance out; failed utterances are logged and skipped so
+//! later lines can still be spoken. A script is a file of lines. `--sr`
 //! resamples the output, which is what feeds the voice-conversion filter:
 //!
 //! ```sh
@@ -18,7 +19,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use clap::{Args, Subcommand, ValueEnum};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader, BufWriter};
 use tts_core::{OUTPUT_SR, SampleOptions, SynthOptions};
 
 use crate::backend::{ModelPaths, load};
@@ -345,33 +346,56 @@ pub async fn synthesize(args: TtsArgs) -> Result<()> {
     let mut model = load_models(&args).await?;
     let opts = args.options();
 
-    let mut lines = BufReader::new(tokio::io::stdin()).lines();
-    let mut out = BufWriter::new(tokio::io::stdout());
-    let mut spoken = 0usize;
-
     let reference = tokio::task::block_in_place(|| {
         model.reference(&audio, &reference_text, args.language.into())
     })
     .context("failed to analyse the reference recording")?;
 
-    while let Some(line) = lines.next_line().await? {
+    synthesize_lines(
+        BufReader::new(tokio::io::stdin()),
+        BufWriter::new(tokio::io::stdout()),
+        args.sr,
+        |line| tokio::task::block_in_place(|| model.say(line, &reference, &opts)),
+    )
+    .await
+}
+
+/// Keep utterance failures local to one line, while propagating I/O failures.
+/// The supplied synthesizer retains its model and reference between lines.
+async fn synthesize_lines(
+    input: impl AsyncBufRead + Unpin,
+    mut out: impl AsyncWrite + Unpin,
+    sr: u32,
+    mut say: impl FnMut(&str) -> tts_core::Result<Vec<f32>>,
+) -> Result<()> {
+    let mut lines = input.lines();
+    let mut spoken = 0usize;
+    let mut skipped = 0usize;
+
+    while let Some(line) = lines.next_line().await.context("reading stdin")? {
         if line.trim().is_empty() {
             continue;
         }
-        let pcm = tokio::task::block_in_place(|| model.say(&line, &reference, &opts))
-            .with_context(|| format!("synthesising {line:?}"))?;
+        let pcm = match say(&line) {
+            Ok(pcm) => pcm,
+            Err(error) => {
+                tracing::warn!("skipping {line:?}: {error}");
+                skipped += 1;
+                continue;
+            }
+        };
         tracing::info!("{:.2} s  {line}", pcm.len() as f32 / OUTPUT_SR as f32);
-        let pcm = audio_kit::resample_linear(&pcm, OUTPUT_SR, args.sr);
+        let pcm = audio_kit::resample_linear(&pcm, OUTPUT_SR, sr);
         audio_kit::write_f32le_chunk(&mut out, &pcm)
             .await
             .context("writing stdout")?;
         // Flush eagerly so downstream players get low latency.
-        out.flush().await.ok();
+        out.flush().await.context("flushing stdout")?;
         spoken += 1;
     }
 
     out.flush().await.context("final flush")?;
-    tracing::info!("{spoken} lines");
+    tracing::info!("{spoken} lines, {skipped} skipped");
     Ok(())
 }
 
@@ -392,6 +416,87 @@ pub(crate) async fn read_reference(path: &std::path::Path) -> Result<Vec<f32>> {
 mod tests {
     use super::*;
     use clap::{Parser, Subcommand};
+
+    #[tokio::test]
+    async fn filter_continues_after_synthesis_errors() {
+        let bad = "「刚才那样喜欢吗」「哪句太过了我以后改」，";
+        // Repeated failures, blank lines, and a last line without a newline.
+        let input = format!("first\n{bad}\n{bad}\n \nlast");
+        let mut attempted = Vec::new();
+        let mut output = Vec::new();
+        synthesize_lines(input.as_bytes(), &mut output, OUTPUT_SR, |line| {
+            attempted.push(line.to_owned());
+            match line {
+                "first" => Ok(vec![0.25, -0.5]),
+                "last" => Ok(vec![0.75]),
+                _ => Err(tts_core::TtsError::Misaligned {
+                    characters: 21,
+                    word2ph: 17,
+                }),
+            }
+        })
+        .await
+        .expect("a failed utterance must not end the filter");
+
+        assert_eq!(attempted, ["first", bad, bad, "last"]);
+        let expected: Vec<u8> = [0.25f32, -0.5, 0.75]
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect();
+        assert_eq!(output, expected, "only successful lines emit PCM");
+    }
+
+    #[tokio::test]
+    async fn filter_reaches_eof_when_every_line_fails() {
+        let mut output = Vec::new();
+        let mut attempted = 0;
+        synthesize_lines(&b"first\nsecond\n"[..], &mut output, OUTPUT_SR, |_| {
+            attempted += 1;
+            Err(tts_core::TtsError::Vocabulary("bad text".into()))
+        })
+        .await
+        .expect("synthesis errors are reported per line, including at EOF");
+        assert_eq!(attempted, 2);
+        assert!(output.is_empty());
+    }
+
+    #[tokio::test]
+    async fn filter_stops_when_the_output_pipe_closes() {
+        let (output, reader) = tokio::io::duplex(64);
+        drop(reader);
+        let mut attempted = 0;
+        let error = synthesize_lines(
+            &b"first\nsecond\n"[..],
+            BufWriter::new(output),
+            OUTPUT_SR,
+            |_| {
+                attempted += 1;
+                Ok(vec![0.25])
+            },
+        )
+        .await
+        .expect_err("an I/O failure must still stop the filter");
+        assert_eq!(
+            error.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::BrokenPipe
+        );
+        assert_eq!(attempted, 1, "do not synthesize after the player exits");
+    }
+
+    #[tokio::test]
+    async fn filter_stops_on_invalid_input() {
+        let mut output = Vec::new();
+        let error = synthesize_lines(&b"\xff\n"[..], &mut output, OUTPUT_SR, |_| {
+            panic!("invalid UTF-8 must fail before synthesis")
+        })
+        .await
+        .expect_err("stdin errors must not be swallowed as synthesis errors");
+        assert_eq!(
+            error.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::InvalidData
+        );
+        assert!(output.is_empty());
+    }
 
     /// The `tts` binary's own tree, minus `completions` — which belongs to the
     /// executable rather than to the engine, and is therefore not part of what
